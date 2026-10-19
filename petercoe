@@ -1,0 +1,1338 @@
+--[[
+	🍎 FRUIT CATCHER 🍎
+	Minigame completo em um único LocalScript (executor Roblox).
+	- Interface, cenário, personagem, frutas e sons gerados automaticamente.
+	- Controles: A / D ou ← / →
+	- Executar novamente remove a versão anterior (sem duplicar GUI, loops ou sons).
+	- Botão ✕ no canto da tela fecha o jogo por completo.
+]]
+
+----------------------------------------------------------------------
+-- SERVIÇOS
+----------------------------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local ContentProvider = game:GetService("ContentProvider")
+local ContextActionService = game:GetService("ContextActionService")
+
+local okCore, CoreGui = pcall(function()
+	return game:GetService("CoreGui")
+end)
+if not okCore then
+	CoreGui = nil
+end
+
+local LocalPlayer = Players.LocalPlayer or Players.PlayerAdded:Wait()
+
+----------------------------------------------------------------------
+-- CONFIGURAÇÃO
+----------------------------------------------------------------------
+local CONFIG = {
+	GuiName = "FruitCatcher_GUI",
+	SoundPrefix = "FruitCatcher_",
+
+	Audio = {
+		Music = "rbxassetid://112495808951940",
+		Catch = "rbxassetid://109608870356288",
+		Lose = "rbxassetid://1844442574",
+	},
+
+	PlayerW = 64,
+	PlayerH = 88,
+	ItemSize = 42,
+	GroundH = 38,
+
+	FruitPoints = 10,
+	SpecialPoints = 30,
+	PointsPerLevel = 100,
+	MaxLevel = 20,
+
+	BombStartScore = 50,
+	BombBaseChance = 0.05,
+	BombMaxChance = 0.20,
+	MaxBombsOnScreen = 2,
+}
+
+local FRUITS = { "🍎", "🍌", "🍇", "🍊", "🍓", "🍉", "🍐", "🍒" }
+local SPECIALS = { "🍍", "🥭", "🍑" }
+
+local COLORS = {
+	card = Color3.fromRGB(36, 34, 68),
+	stroke = Color3.fromRGB(110, 100, 190),
+	white = Color3.fromRGB(255, 255, 255),
+	gray = Color3.fromRGB(170, 170, 210),
+	gold = Color3.fromRGB(255, 205, 70),
+	green = Color3.fromRGB(70, 200, 120),
+	red = Color3.fromRGB(235, 80, 90),
+	orange = Color3.fromRGB(255, 150, 50),
+}
+
+----------------------------------------------------------------------
+-- AMBIENTE / LIMPEZA DE EXECUÇÕES ANTERIORES
+----------------------------------------------------------------------
+local function getEnv()
+	if type(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" then
+			return env
+		end
+	end
+	return _G
+end
+
+local ENV = getEnv()
+local INSTANCE_KEY = "__FruitCatcherInstance"
+local BEST_KEY = "__FruitCatcherBest"
+
+if type(ENV[INSTANCE_KEY]) == "table" and type(ENV[INSTANCE_KEY].Destroy) == "function" then
+	pcall(ENV[INSTANCE_KEY].Destroy)
+end
+ENV[INSTANCE_KEY] = nil
+
+local function allGuiParents()
+	local list = {}
+	if type(gethui) == "function" then
+		local ok, h = pcall(gethui)
+		if ok and typeof(h) == "Instance" then
+			list[#list + 1] = h
+		end
+	end
+	if CoreGui then
+		list[#list + 1] = CoreGui
+	end
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if pg then
+		list[#list + 1] = pg
+	end
+	return list
+end
+
+local function purgeOld()
+	for _, parent in ipairs(allGuiParents()) do
+		pcall(function()
+			for _, child in ipairs(parent:GetChildren()) do
+				if child.Name == CONFIG.GuiName then
+					child:Destroy()
+				end
+			end
+		end)
+	end
+	pcall(function()
+		for _, child in ipairs(SoundService:GetChildren()) do
+			if string.sub(child.Name, 1, #CONFIG.SoundPrefix) == CONFIG.SoundPrefix then
+				child:Destroy()
+			end
+		end
+	end)
+end
+purgeOld()
+
+math.randomseed(os.time())
+
+----------------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------------
+local connections = {}
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	connections[#connections + 1] = c
+	return c
+end
+
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	if props then
+		for k, v in pairs(props) do
+			inst[k] = v
+		end
+	end
+	if parent then
+		inst.Parent = parent
+	end
+	return inst
+end
+
+local function round(inst, radius)
+	return new("UICorner", { CornerRadius = radius or UDim.new(0, 10) }, inst)
+end
+
+local function stroke(inst, color, thickness, transparency)
+	return new("UIStroke", {
+		Color = color or COLORS.stroke,
+		Thickness = thickness or 2,
+		Transparency = transparency or 0,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, inst)
+end
+
+local function tween(inst, time, props, style, dir)
+	local ok, tw = pcall(function()
+		local t = TweenService:Create(
+			inst,
+			TweenInfo.new(time, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out),
+			props
+		)
+		t:Play()
+		return t
+	end)
+	return ok and tw or nil
+end
+
+local function safeDestroy(inst)
+	if inst then
+		pcall(function()
+			inst:Destroy()
+		end)
+	end
+end
+
+local function pick(list)
+	return list[math.random(#list)]
+end
+
+local function overlaps(ax, ay, aw, ah, bx, by, bw, bh)
+	return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+end
+
+----------------------------------------------------------------------
+-- INTERFACE: ScreenGui
+----------------------------------------------------------------------
+local gui = new("ScreenGui", {
+	Name = CONFIG.GuiName,
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 9999,
+})
+
+pcall(function()
+	if syn and syn.protect_gui then
+		syn.protect_gui(gui)
+	end
+end)
+
+local attached = false
+for _, parent in ipairs(allGuiParents()) do
+	local ok = pcall(function()
+		gui.Parent = parent
+	end)
+	if ok and gui.Parent == parent then
+		attached = true
+		break
+	end
+end
+if not attached then
+	local pg = LocalPlayer:WaitForChild("PlayerGui", 10)
+	if pg then
+		gui.Parent = pg
+		attached = true
+	end
+end
+if not attached then
+	warn("[FruitCatcher] Não foi possível criar a interface.")
+	return
+end
+
+local destroyAll -- declarada abaixo
+
+-- Fundo geral
+local backdrop = new("Frame", {
+	Name = "Backdrop",
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = Color3.fromRGB(28, 22, 62),
+	BorderSizePixel = 0,
+	Active = true,
+	ZIndex = 1,
+}, gui)
+new("UIGradient", {
+	Color = ColorSequence.new(Color3.fromRGB(58, 36, 120), Color3.fromRGB(12, 12, 32)),
+	Rotation = 90,
+}, backdrop)
+
+-- Botão fechar
+local closeBtn = new("TextButton", {
+	Name = "Close",
+	Text = "✕",
+	Font = Enum.Font.GothamBlack,
+	TextSize = 20,
+	TextColor3 = COLORS.white,
+	BackgroundColor3 = COLORS.red,
+	AutoButtonColor = true,
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -12, 0, 12),
+	Size = UDim2.fromOffset(38, 38),
+	ZIndex = 50,
+}, backdrop)
+round(closeBtn, UDim.new(0, 10))
+
+-- Container principal
+local main = new("Frame", {
+	Name = "Main",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromScale(0.94, 0.9),
+	BackgroundTransparency = 1,
+	ZIndex = 2,
+}, backdrop)
+new("UISizeConstraint", {
+	MinSize = Vector2.new(320, 380),
+	MaxSize = Vector2.new(820, 700),
+}, main)
+
+----------------------------------------------------------------------
+-- HUD
+----------------------------------------------------------------------
+local hud = new("Frame", {
+	Name = "HUD",
+	Size = UDim2.new(1, 0, 0, 66),
+	BackgroundTransparency = 1,
+	ZIndex = 3,
+}, main)
+
+local function makeCard(xScale, caption)
+	local card = new("Frame", {
+		BackgroundColor3 = COLORS.card,
+		Size = UDim2.new(0.32, 0, 1, 0),
+		Position = UDim2.new(xScale, 0, 0, 0),
+		BorderSizePixel = 0,
+		ZIndex = 3,
+	}, hud)
+	round(card, UDim.new(0, 12))
+	stroke(card, COLORS.stroke, 1.5, 0.3)
+	local scale = new("UIScale", { Scale = 1 }, card)
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = caption,
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = COLORS.gray,
+		Size = UDim2.new(1, -12, 0, 16),
+		Position = UDim2.fromOffset(6, 6),
+		ZIndex = 4,
+	}, card)
+	local value = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = "0",
+		Font = Enum.Font.GothamBlack,
+		TextScaled = true,
+		TextColor3 = COLORS.white,
+		Size = UDim2.new(1, -12, 1, -30),
+		Position = UDim2.fromOffset(6, 24),
+		ZIndex = 4,
+	}, card)
+	new("UITextSizeConstraint", { MaxTextSize = 28, MinTextSize = 8 }, value)
+	return value, scale
+end
+
+local scoreValue, scoreScale = makeCard(0, "PONTOS")
+local levelValue, levelScale = makeCard(0.34, "DIFICULDADE")
+local bestValue = makeCard(0.68, "RECORDE")
+
+----------------------------------------------------------------------
+-- ÁREA DE JOGO (cenário)
+----------------------------------------------------------------------
+local area = new("Frame", {
+	Name = "GameArea",
+	Position = UDim2.new(0, 0, 0, 78),
+	Size = UDim2.new(1, 0, 1, -78),
+	BackgroundColor3 = Color3.fromRGB(120, 200, 255),
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	ZIndex = 3,
+}, main)
+round(area, UDim.new(0, 16))
+stroke(area, Color3.fromRGB(190, 180, 255), 3, 0.2)
+new("UIGradient", {
+	Color = ColorSequence.new(Color3.fromRGB(96, 178, 255), Color3.fromRGB(205, 236, 255)),
+	Rotation = 90,
+}, area)
+
+-- Sol
+local sun = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(255, 228, 110),
+	Size = UDim2.fromOffset(54, 54),
+	Position = UDim2.fromOffset(22, 20),
+	ZIndex = 1,
+}, area)
+round(sun, UDim.new(1, 0))
+stroke(sun, Color3.fromRGB(255, 244, 180), 7, 0.5)
+
+-- Nuvens
+local clouds = {}
+for i = 1, 4 do
+	local w = math.random(70, 120)
+	local holder = new("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(w, 34),
+		ZIndex = 1,
+	}, area)
+	local base = new("Frame", {
+		BackgroundColor3 = COLORS.white,
+		BackgroundTransparency = 0.12,
+		Size = UDim2.new(1, 0, 0, 22),
+		Position = UDim2.new(0, 0, 1, -22),
+		BorderSizePixel = 0,
+	}, holder)
+	round(base, UDim.new(0, 11))
+	local bump = new("Frame", {
+		BackgroundColor3 = COLORS.white,
+		BackgroundTransparency = 0.12,
+		Size = UDim2.fromOffset(math.floor(w * 0.45), 28),
+		Position = UDim2.new(0.2, 0, 0, 0),
+		BorderSizePixel = 0,
+	}, holder)
+	round(bump, UDim.new(1, 0))
+	clouds[i] = {
+		gui = holder,
+		w = w,
+		x = math.random(0, 600),
+		y = math.random(20, 110),
+		speed = math.random(8, 22),
+	}
+end
+
+-- Colinas
+for _, def in ipairs({ { 0.22, Color3.fromRGB(96, 190, 110) }, { 0.72, Color3.fromRGB(76, 170, 96) } }) do
+	local hill = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0),
+		BackgroundColor3 = def[2],
+		Size = UDim2.fromOffset(340, 340),
+		Position = UDim2.new(def[1], 0, 1, -(CONFIG.GroundH + 90)),
+		BorderSizePixel = 0,
+		ZIndex = 1,
+	}, area)
+	round(hill, UDim.new(1, 0))
+end
+
+-- Chão
+local ground = new("Frame", {
+	Name = "Ground",
+	AnchorPoint = Vector2.new(0, 1),
+	Position = UDim2.new(0, 0, 1, 0),
+	Size = UDim2.new(1, 0, 0, CONFIG.GroundH),
+	BackgroundColor3 = Color3.fromRGB(110, 78, 50),
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, area)
+local grass = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 14),
+	BackgroundColor3 = Color3.fromRGB(88, 196, 84),
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, ground)
+new("Frame", {
+	Size = UDim2.new(1, 0, 0, 4),
+	Position = UDim2.new(0, 0, 0, 14),
+	BackgroundColor3 = Color3.fromRGB(60, 150, 60),
+	BorderSizePixel = 0,
+	ZIndex = 2,
+}, ground)
+
+----------------------------------------------------------------------
+-- PERSONAGEM (bonequinho com cesta)
+----------------------------------------------------------------------
+local PW, PH, ITEM, GROUND_H = CONFIG.PlayerW, CONFIG.PlayerH, CONFIG.ItemSize, CONFIG.GroundH
+
+local player = new("Frame", {
+	Name = "Player",
+	BackgroundTransparency = 1,
+	Size = UDim2.fromOffset(PW, PH),
+	Position = UDim2.new(0.5, -PW / 2, 1, -(GROUND_H + PH - 6)),
+	ZIndex = 5,
+}, area)
+local playerScale = new("UIScale", { Scale = 1 }, player)
+
+local legL = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(40, 40, 70),
+	Size = UDim2.fromOffset(11, 17),
+	Position = UDim2.fromOffset(20, 72),
+	BorderSizePixel = 0,
+}, player)
+round(legL, UDim.new(0, 4))
+local legR = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(40, 40, 70),
+	Size = UDim2.fromOffset(11, 17),
+	Position = UDim2.fromOffset(34, 72),
+	BorderSizePixel = 0,
+}, player)
+round(legR, UDim.new(0, 4))
+
+for _, ax in ipairs({ 9, 49 }) do
+	local arm = new("Frame", {
+		BackgroundColor3 = Color3.fromRGB(70, 140, 255),
+		Size = UDim2.fromOffset(7, 36),
+		Position = UDim2.fromOffset(ax, 17),
+		BorderSizePixel = 0,
+	}, player)
+	round(arm, UDim.new(0, 4))
+end
+
+local body = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(60, 130, 255),
+	Size = UDim2.fromOffset(32, 28),
+	Position = UDim2.fromOffset(16, 46),
+	BorderSizePixel = 0,
+}, player)
+round(body, UDim.new(0, 8))
+
+local head = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(255, 224, 189),
+	Size = UDim2.fromOffset(26, 26),
+	Position = UDim2.fromOffset(19, 20),
+	BorderSizePixel = 0,
+}, player)
+round(head, UDim.new(1, 0))
+stroke(head, Color3.fromRGB(200, 160, 120), 1.5, 0)
+
+local eyeL = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(30, 30, 40),
+	Size = UDim2.fromOffset(4, 5),
+	Position = UDim2.fromOffset(6, 10),
+	BorderSizePixel = 0,
+}, head)
+round(eyeL, UDim.new(1, 0))
+local eyeR = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(30, 30, 40),
+	Size = UDim2.fromOffset(4, 5),
+	Position = UDim2.fromOffset(16, 10),
+	BorderSizePixel = 0,
+}, head)
+round(eyeR, UDim.new(1, 0))
+local mouth = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(200, 90, 90),
+	Size = UDim2.fromOffset(10, 4),
+	Position = UDim2.fromOffset(8, 18),
+	BorderSizePixel = 0,
+}, head)
+round(mouth, UDim.new(1, 0))
+
+local basket = new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(176, 114, 56),
+	Size = UDim2.fromOffset(PW, 18),
+	Position = UDim2.fromOffset(0, 0),
+	BorderSizePixel = 0,
+}, player)
+round(basket, UDim.new(0, 7))
+stroke(basket, Color3.fromRGB(110, 66, 30), 2, 0)
+new("Frame", {
+	BackgroundColor3 = Color3.fromRGB(210, 150, 85),
+	Size = UDim2.new(1, -10, 0, 4),
+	Position = UDim2.fromOffset(5, 4),
+	BorderSizePixel = 0,
+}, basket)
+
+----------------------------------------------------------------------
+-- EFEITOS VISUAIS
+----------------------------------------------------------------------
+local flash = new("Frame", {
+	BackgroundColor3 = COLORS.red,
+	BackgroundTransparency = 1,
+	Size = UDim2.fromScale(1, 1),
+	BorderSizePixel = 0,
+	ZIndex = 15,
+}, area)
+
+local function popText(text, x, y, color, textSize, lifetime, rise)
+	local lbl = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.GothamBlack,
+		TextSize = textSize or 22,
+		TextColor3 = color or COLORS.white,
+		TextStrokeColor3 = Color3.new(0, 0, 0),
+		TextStrokeTransparency = 0.4,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(x, y),
+		Size = UDim2.fromOffset(220, 40),
+		ZIndex = 12,
+	}, area)
+	tween(lbl, lifetime or 0.7, {
+		Position = UDim2.fromOffset(x, y - (rise or 50)),
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
+	})
+	task.delay((lifetime or 0.7) + 0.05, function()
+		safeDestroy(lbl)
+	end)
+end
+
+local function burst(emoji, x, y)
+	local lbl = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = emoji,
+		TextScaled = true,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(x, y),
+		Size = UDim2.fromOffset(30, 30),
+		ZIndex = 13,
+	}, area)
+	tween(lbl, 0.5, { Size = UDim2.fromOffset(100, 100), TextTransparency = 1 })
+	task.delay(0.55, function()
+		safeDestroy(lbl)
+	end)
+end
+
+local function bump(uiScale)
+	uiScale.Scale = 1.15
+	tween(uiScale, 0.25, { Scale = 1 }, Enum.EasingStyle.Back)
+end
+
+----------------------------------------------------------------------
+-- BOTÕES E TELAS (menu / game over)
+----------------------------------------------------------------------
+local function makeButton(parent, text, color, size, position)
+	local btn = new("TextButton", {
+		Text = text,
+		Font = Enum.Font.GothamBlack,
+		TextScaled = true,
+		TextColor3 = COLORS.white,
+		BackgroundColor3 = color,
+		AutoButtonColor = false,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = size,
+		Position = position,
+		BorderSizePixel = 0,
+		ZIndex = 30,
+	}, parent)
+	round(btn, UDim.new(0, 14))
+	stroke(btn, Color3.fromRGB(255, 255, 255), 2, 0.6)
+	new("UITextSizeConstraint", { MaxTextSize = 26, MinTextSize = 10 }, btn)
+	new("UIPadding", {
+		PaddingLeft = UDim.new(0, 10),
+		PaddingRight = UDim.new(0, 10),
+		PaddingTop = UDim.new(0, 6),
+		PaddingBottom = UDim.new(0, 6),
+	}, btn)
+	local scale = new("UIScale", { Scale = 1 }, btn)
+	connect(btn.MouseEnter, function()
+		tween(scale, 0.12, { Scale = 1.06 })
+	end)
+	connect(btn.MouseLeave, function()
+		tween(scale, 0.12, { Scale = 1 })
+	end)
+	connect(btn.MouseButton1Down, function()
+		tween(scale, 0.08, { Scale = 0.95 })
+	end)
+	connect(btn.MouseButton1Up, function()
+		tween(scale, 0.1, { Scale = 1.06 })
+	end)
+	return btn
+end
+
+local function makeLabel(parent, text, yScale, hScale, color, bold)
+	local lbl = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = bold and Enum.Font.GothamBlack or Enum.Font.GothamBold,
+		TextScaled = true,
+		TextColor3 = color or COLORS.white,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, yScale),
+		Size = UDim2.fromScale(0.9, hScale),
+		ZIndex = 30,
+	}, parent)
+	new("UITextSizeConstraint", { MaxTextSize = bold and 44 or 22, MinTextSize = 8 }, lbl)
+	return lbl
+end
+
+local function makeOverlay(name)
+	local overlay = new("Frame", {
+		Name = name,
+		BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 0.45,
+		Size = UDim2.fromScale(1, 1),
+		BorderSizePixel = 0,
+		Active = true,
+		Visible = false,
+		ZIndex = 20,
+	}, area)
+	local card = new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromScale(0.9, 0.9),
+		BackgroundColor3 = COLORS.card,
+		BorderSizePixel = 0,
+		ZIndex = 25,
+	}, overlay)
+	round(card, UDim.new(0, 18))
+	stroke(card, COLORS.stroke, 3, 0.1)
+	new("UISizeConstraint", { MaxSize = Vector2.new(460, 390) }, card)
+	local scale = new("UIScale", { Scale = 1 }, card)
+	return overlay, card, scale
+end
+
+-- Menu inicial
+local menuOverlay, menuCard, menuScale = makeOverlay("Menu")
+makeLabel(menuCard, "🍎 FRUIT CATCHER", 0.15, 0.17, COLORS.gold, true)
+makeLabel(menuCard, "Pegue as frutas e fuja das bombas!", 0.30, 0.08, COLORS.white)
+makeLabel(menuCard, "🍎 +10   🍍 +30 (especial)   💣 = fim de jogo", 0.41, 0.08, COLORS.gray)
+makeLabel(menuCard, "Mova com A / D ou ← / →", 0.52, 0.08, COLORS.white)
+makeLabel(menuCard, "Se uma fruta cair no chão, você perde!", 0.62, 0.08, COLORS.orange)
+local playBtn = makeButton(menuCard, "JOGAR", COLORS.green, UDim2.fromScale(0.6, 0.17), UDim2.fromScale(0.5, 0.83))
+
+-- Tela de derrota
+local overOverlay, overCard, overScale = makeOverlay("GameOver")
+makeLabel(overCard, "VOCÊ PERDEU!", 0.14, 0.17, COLORS.red, true)
+local overReason = makeLabel(overCard, "", 0.29, 0.08, COLORS.gray)
+makeLabel(overCard, "Pontuação final", 0.40, 0.07, COLORS.gray)
+local overScore = makeLabel(overCard, "0", 0.52, 0.16, COLORS.gold, true)
+local overBest = makeLabel(overCard, "", 0.67, 0.08, COLORS.white)
+local againBtn = makeButton(overCard, "JOGAR NOVAMENTE", COLORS.green, UDim2.fromScale(0.78, 0.16), UDim2.fromScale(0.5, 0.85))
+
+-- Botão de som
+local muteBtn = new("TextButton", {
+	Text = "🔊",
+	TextSize = 20,
+	Font = Enum.Font.GothamBold,
+	BackgroundColor3 = Color3.fromRGB(30, 30, 60),
+	BackgroundTransparency = 0.35,
+	TextColor3 = COLORS.white,
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -10, 0, 10),
+	Size = UDim2.fromOffset(38, 38),
+	AutoButtonColor = true,
+	ZIndex = 26,
+}, area)
+round(muteBtn, UDim.new(0, 10))
+
+----------------------------------------------------------------------
+-- ÁUDIO (com tratamento de erros)
+----------------------------------------------------------------------
+local function createSound(name, id, volume, looped)
+	local ok, sound = pcall(function()
+		local s = Instance.new("Sound")
+		s.Name = CONFIG.SoundPrefix .. name
+		s.SoundId = id
+		s.Volume = volume
+		s.Looped = looped or false
+		s.Parent = SoundService
+		return s
+	end)
+	if ok then
+		return sound
+	end
+	return nil
+end
+
+local music = createSound("Music", CONFIG.Audio.Music, 0.5, true)
+local sfxCatch = createSound("Catch", CONFIG.Audio.Catch, 1, false)
+local sfxLose = createSound("Lose", CONFIG.Audio.Lose, 1, false)
+
+local muted = false
+local VOLUMES = { music = 0.5, catch = 1, lose = 1 }
+
+local function applyVolumes()
+	pcall(function()
+		if music then
+			music.Volume = muted and 0 or VOLUMES.music
+		end
+		if sfxCatch then
+			sfxCatch.Volume = muted and 0 or VOLUMES.catch
+		end
+		if sfxLose then
+			sfxLose.Volume = muted and 0 or VOLUMES.lose
+		end
+	end)
+	muteBtn.Text = muted and "🔇" or "🔊"
+end
+
+local function safePlay(sound, restart)
+	if not sound then
+		return
+	end
+	pcall(function()
+		if restart then
+			sound.TimePosition = 0
+		end
+		sound:Play()
+	end)
+end
+
+local function safeStop(sound)
+	if not sound then
+		return
+	end
+	pcall(function()
+		sound:Stop()
+	end)
+end
+
+-- Pré-carrega sem bloquear o jogo; falhas são ignoradas
+task.spawn(function()
+	pcall(function()
+		local list = {}
+		for _, s in ipairs({ music, sfxCatch, sfxLose }) do
+			if s then
+				list[#list + 1] = s
+			end
+		end
+		if #list > 0 then
+			ContentProvider:PreloadAsync(list)
+		end
+	end)
+end)
+
+----------------------------------------------------------------------
+-- ESTADO DO JOGO
+----------------------------------------------------------------------
+local state = "menu" -- "menu" | "playing" | "over" | "destroyed"
+local score = 0
+local best = tonumber(ENV[BEST_KEY]) or 0
+local items = {}
+local px, vel = 0, 0
+local walkT = 0
+local gameTime = 0
+local spawnTimer = 0
+local lastFruitX, lastFruitTime = 0, -1
+local pendingFruitX = nil
+local lastWasBomb = false
+local keys = {}
+local overShownAt = 0
+local lastLevel = 1
+local actionBound = false
+
+local function levelFromScore(s)
+	return math.min(CONFIG.MaxLevel, 1 + math.floor(s / CONFIG.PointsPerLevel))
+end
+
+local function difficultyName(level)
+	if level <= 2 then
+		return "Fácil", COLORS.green
+	elseif level <= 5 then
+		return "Médio", COLORS.gold
+	elseif level <= 9 then
+		return "Difícil", COLORS.orange
+	end
+	return "Insano", COLORS.red
+end
+
+local function updateHud()
+	scoreValue.Text = tostring(score)
+	local lvl = levelFromScore(score)
+	local name, color = difficultyName(lvl)
+	levelValue.Text = "Nv." .. lvl .. " " .. name
+	levelValue.TextColor3 = color
+	bestValue.Text = tostring(best)
+end
+
+local function playerMaxSpeed(areaW)
+	return math.max(420, areaW * 0.9)
+end
+
+local function fallSpeed(areaH)
+	return areaH * math.min(1.05, 0.42 + score * 0.00055)
+end
+
+local function spawnInterval()
+	return math.max(0.42, 1.25 - score * 0.0008)
+end
+
+local function countBombs()
+	local n = 0
+	for _, it in ipairs(items) do
+		if it.kind == "bomb" then
+			n = n + 1
+		end
+	end
+	return n
+end
+
+local function clearItems()
+	for _, it in ipairs(items) do
+		safeDestroy(it.gui)
+	end
+	items = {}
+end
+
+local function createItem(kind, x, speed)
+	local emoji, pts
+	if kind == "bomb" then
+		emoji, pts = "💣", 0
+	elseif kind == "special" then
+		emoji, pts = pick(SPECIALS), CONFIG.SpecialPoints
+	else
+		emoji, pts = pick(FRUITS), CONFIG.FruitPoints
+	end
+
+	local holder = new("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(ITEM, ITEM),
+		Position = UDim2.fromOffset(x, -ITEM),
+		ZIndex = 4,
+	}, area)
+
+	local aura
+	if kind == "special" then
+		aura = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(ITEM + 14, ITEM + 14),
+			BackgroundColor3 = COLORS.gold,
+			BackgroundTransparency = 0.55,
+			BorderSizePixel = 0,
+			ZIndex = 1,
+		}, holder)
+		round(aura, UDim.new(1, 0))
+		stroke(aura, COLORS.gold, 2, 0.2)
+	elseif kind == "bomb" then
+		aura = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(ITEM + 8, ITEM + 8),
+			BackgroundColor3 = COLORS.red,
+			BackgroundTransparency = 0.7,
+			BorderSizePixel = 0,
+			ZIndex = 1,
+		}, holder)
+		round(aura, UDim.new(1, 0))
+	end
+
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Text = emoji,
+		TextScaled = true,
+		Font = Enum.Font.Gotham,
+		TextColor3 = COLORS.white,
+		Size = UDim2.fromScale(1, 1),
+		ZIndex = 2,
+	}, holder)
+
+	items[#items + 1] = {
+		gui = holder,
+		aura = aura,
+		kind = kind,
+		pts = pts,
+		x = x,
+		y = -ITEM,
+		speed = speed,
+		rot = 0,
+		rotSpeed = (kind == "bomb") and math.random(-30, 30) or math.random(-120, 120),
+	}
+end
+
+local function spawnItem(areaW, areaH)
+	local maxX = areaW - ITEM
+	local maxSpeed = playerMaxSpeed(areaW)
+	local interval = spawnInterval()
+	local speed = fallSpeed(areaH)
+
+	-- Bomba ocasional: só aparece se existir um espaço seguro fora do caminho do jogador
+	local wantBomb = false
+	if score >= CONFIG.BombStartScore and not lastWasBomb and countBombs() < CONFIG.MaxBombsOnScreen then
+		local chance = math.min(
+			CONFIG.BombMaxChance,
+			CONFIG.BombBaseChance + (score - CONFIG.BombStartScore) * 0.00015
+		)
+		wantBomb = math.random() < chance
+	end
+
+	if wantBomb then
+		local nextDelay = interval * (0.95 + math.random() * 0.2)
+		local gap = (gameTime - lastFruitTime) + nextDelay
+		local reach = maxSpeed * gap * 0.7 + PW * 0.5
+		local lo = math.max(0, lastFruitX - reach)
+		local hi = math.min(maxX, lastFruitX + reach)
+		local nx = lo + math.random() * (hi - lo)
+
+		local a = math.min(lastFruitX, nx) - PW - ITEM * 0.5
+		local b = math.max(lastFruitX, nx) + ITEM + PW
+		local options = {}
+		if a - ITEM >= 0 then
+			options[#options + 1] = { 0, a - ITEM }
+		end
+		if b <= maxX then
+			options[#options + 1] = { b, maxX }
+		end
+
+		if #options > 0 then
+			local o = options[math.random(#options)]
+			local bx = o[1] + math.random() * (o[2] - o[1])
+			createItem("bomb", bx, speed)
+			pendingFruitX = nx
+			spawnTimer = nextDelay
+			lastWasBomb = true
+			return
+		end
+	end
+
+	-- Fruta (sempre alcançável a partir da última)
+	local x
+	if pendingFruitX then
+		x = pendingFruitX
+		pendingFruitX = nil
+	else
+		local gap = math.max(0.2, gameTime - lastFruitTime)
+		local reach = maxSpeed * gap * 0.7 + PW * 0.5
+		local lo = math.max(0, lastFruitX - reach)
+		local hi = math.min(maxX, lastFruitX + reach)
+		x = lo + math.random() * (hi - lo)
+	end
+	x = math.clamp(x, 0, maxX)
+
+	local specialChance = math.min(0.18, 0.08 + score * 0.00006)
+	local kind = (math.random() < specialChance) and "special" or "fruit"
+	createItem(kind, x, speed)
+
+	lastFruitX = x
+	lastFruitTime = gameTime
+	lastWasBomb = false
+	spawnTimer = interval * (0.9 + math.random() * 0.25)
+end
+
+----------------------------------------------------------------------
+-- CONTROLES
+----------------------------------------------------------------------
+local ACTION_NAME = "FruitCatcher_Move"
+local MOVE_KEYS = {
+	Enum.KeyCode.A,
+	Enum.KeyCode.D,
+	Enum.KeyCode.Left,
+	Enum.KeyCode.Right,
+}
+
+local function onMoveAction(_, inputState, input)
+	if inputState == Enum.UserInputState.Begin then
+		keys[input.KeyCode] = true
+	else
+		keys[input.KeyCode] = nil
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+local function bindMovement()
+	if actionBound then
+		return
+	end
+	local ok = pcall(function()
+		ContextActionService:BindActionAtPriority(ACTION_NAME, onMoveAction, false, 3000, unpack(MOVE_KEYS))
+	end)
+	actionBound = ok
+end
+
+local function unbindMovement()
+	if actionBound then
+		pcall(function()
+			ContextActionService:UnbindAction(ACTION_NAME)
+		end)
+		actionBound = false
+	end
+	keys = {}
+end
+
+----------------------------------------------------------------------
+-- FLUXO: INICIAR / PERDER
+----------------------------------------------------------------------
+local function showOverlay(overlay, card, scale)
+	overlay.Visible = true
+	overlay.BackgroundTransparency = 1
+	scale.Scale = 0.7
+	tween(overlay, 0.3, { BackgroundTransparency = 0.45 })
+	tween(scale, 0.35, { Scale = 1 }, Enum.EasingStyle.Back)
+end
+
+local function startGame()
+	if state == "playing" or state == "destroyed" then
+		return
+	end
+	clearItems()
+
+	score = 0
+	lastLevel = 1
+	vel = 0
+	walkT = 0
+	gameTime = 0
+	spawnTimer = 0.7
+	pendingFruitX = nil
+	lastWasBomb = false
+	keys = {}
+
+	local size = area.AbsoluteSize
+	px = (size.X - PW) / 2
+	lastFruitX = (size.X - ITEM) / 2
+	lastFruitTime = -1
+
+	menuOverlay.Visible = false
+	overOverlay.Visible = false
+	flash.BackgroundTransparency = 1
+	player.Rotation = 0
+
+	state = "playing"
+	bindMovement()
+	updateHud()
+
+	-- Música em loop durante a partida
+	safeStop(music)
+	safePlay(music, true)
+end
+
+local function lose(reason, x, y)
+	if state ~= "playing" then
+		return
+	end
+	state = "over"
+	unbindMovement()
+
+	local newRecord = false
+	if score > best then
+		best = score
+		newRecord = true
+		ENV[BEST_KEY] = best
+	end
+	updateHud()
+
+	-- Para a música e toca o som de derrota uma única vez
+	safeStop(music)
+	safeStop(sfxLose)
+	safePlay(sfxLose, true)
+
+	-- Efeitos
+	flash.BackgroundTransparency = 0.45
+	tween(flash, 0.6, { BackgroundTransparency = 1 })
+	burst("💥", x or 0, y or 0)
+
+	overReason.Text = (reason == "bomb") and "💣 Você tocou numa bomba!" or "🍎 Uma fruta caiu no chão!"
+	overScore.Text = tostring(score)
+	overBest.Text = newRecord and "🏆 NOVO RECORDE!" or ("Recorde: " .. best)
+	overShownAt = os.clock()
+	showOverlay(overOverlay, overCard, overScale)
+end
+
+local function catchItem(it, index, py)
+	if it.kind == "bomb" then
+		lose("bomb", it.x + ITEM / 2, it.y + ITEM / 2)
+		return
+	end
+
+	score = score + it.pts
+	table.remove(items, index)
+	safeDestroy(it.gui)
+
+	local special = it.kind == "special"
+	popText(
+		"+" .. it.pts,
+		it.x + ITEM / 2,
+		it.y,
+		special and COLORS.gold or COLORS.white,
+		special and 30 or 22,
+		0.7,
+		55
+	)
+	if special then
+		burst("✨", it.x + ITEM / 2, it.y + ITEM / 2)
+	end
+
+	-- Som de coleta
+	safePlay(sfxCatch, true)
+
+	-- Animações
+	playerScale.Scale = 1.12
+	tween(playerScale, 0.2, { Scale = 1 }, Enum.EasingStyle.Back)
+	bump(scoreScale)
+
+	local lvl = levelFromScore(score)
+	if lvl > lastLevel then
+		lastLevel = lvl
+		bump(levelScale)
+		local size = area.AbsoluteSize
+		popText("NÍVEL " .. lvl .. "!", size.X / 2, size.Y * 0.3, COLORS.gold, 34, 1.1, 40)
+	end
+	updateHud()
+end
+
+----------------------------------------------------------------------
+-- LOOP PRINCIPAL
+----------------------------------------------------------------------
+local function animateClouds(dt, areaW)
+	for _, c in ipairs(clouds) do
+		c.x = c.x + c.speed * dt
+		if c.x > areaW + 20 then
+			c.x = -c.w - 20
+		end
+		c.gui.Position = UDim2.fromOffset(c.x, c.y)
+	end
+end
+
+local function onFrame(dt)
+	dt = math.min(dt, 0.05)
+	local size = area.AbsoluteSize
+	local areaW, areaH = size.X, size.Y
+	if areaW < 50 or areaH < 50 then
+		return
+	end
+
+	animateClouds(dt, areaW)
+
+	if state ~= "playing" then
+		return
+	end
+
+	gameTime = gameTime + dt
+	local groundTop = areaH - GROUND_H
+	local py = groundTop - PH + 6
+
+	-- Movimento suave do jogador
+	local dir = 0
+	if keys[Enum.KeyCode.A] or keys[Enum.KeyCode.Left] then
+		dir = dir - 1
+	end
+	if keys[Enum.KeyCode.D] or keys[Enum.KeyCode.Right] then
+		dir = dir + 1
+	end
+	local maxSpeed = playerMaxSpeed(areaW)
+	vel = vel + (dir * maxSpeed - vel) * math.min(1, dt * 11)
+	px = px + vel * dt
+	if px < 0 then
+		px = 0
+		if vel < 0 then
+			vel = 0
+		end
+	elseif px > areaW - PW then
+		px = areaW - PW
+		if vel > 0 then
+			vel = 0
+		end
+	end
+	player.Position = UDim2.fromOffset(px, py)
+
+	-- Animação do bonequinho
+	local ratio = math.clamp(vel / maxSpeed, -1, 1)
+	walkT = walkT + dt * 16 * math.abs(ratio)
+	local swing = math.sin(walkT) * 5 * math.abs(ratio)
+	legL.Position = UDim2.fromOffset(20 + swing, 72)
+	legR.Position = UDim2.fromOffset(34 - swing, 72)
+	player.Rotation = ratio * 6
+	eyeL.Position = UDim2.fromOffset(6 + ratio * 2, 10)
+	eyeR.Position = UDim2.fromOffset(16 + ratio * 2, 10)
+
+	-- Surgimento
+	spawnTimer = spawnTimer - dt
+	if spawnTimer <= 0 then
+		spawnItem(areaW, areaH)
+	end
+
+	-- Atualiza frutas / bombas
+	for i = #items, 1, -1 do
+		local it = items[i]
+		if state ~= "playing" then
+			break
+		end
+		it.y = it.y + it.speed * dt
+		it.rot = it.rot + it.rotSpeed * dt
+		it.gui.Position = UDim2.fromOffset(it.x, it.y)
+		it.gui.Rotation = it.rot
+		if it.kind == "special" and it.aura then
+			it.aura.BackgroundTransparency = 0.55 + 0.2 * math.sin(gameTime * 8)
+		elseif it.kind == "bomb" and it.aura then
+			it.aura.BackgroundTransparency = 0.7 + 0.25 * math.sin(gameTime * 12)
+		end
+
+		-- Colisão com o jogador
+		if overlaps(it.x + 6, it.y + 6, ITEM - 12, ITEM - 12, px + 4, py, PW - 8, PH) then
+			catchItem(it, i, py)
+		elseif it.y + ITEM >= groundTop + 4 then
+			-- Tocou o chão
+			if it.kind == "bomb" then
+				table.remove(items, i)
+				burst("💨", it.x + ITEM / 2, groundTop - 10)
+				safeDestroy(it.gui)
+			else
+				lose("fruit", it.x + ITEM / 2, groundTop - 10)
+			end
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- EVENTOS DE INTERFACE E ENTRADA
+----------------------------------------------------------------------
+connect(playBtn.Activated, startGame)
+connect(againBtn.Activated, startGame)
+
+connect(muteBtn.Activated, function()
+	muted = not muted
+	applyVolumes()
+end)
+
+connect(closeBtn.Activated, function()
+	if destroyAll then
+		destroyAll()
+	end
+end)
+
+connect(UserInputService.InputBegan, function(input)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	if UserInputService:GetFocusedTextBox() then
+		return
+	end
+	local kc = input.KeyCode
+	if kc == Enum.KeyCode.A or kc == Enum.KeyCode.D or kc == Enum.KeyCode.Left or kc == Enum.KeyCode.Right then
+		if state == "playing" then
+			keys[kc] = true
+		end
+	elseif kc == Enum.KeyCode.Return or kc == Enum.KeyCode.Space then
+		if state == "menu" or (state == "over" and os.clock() - overShownAt > 0.6) then
+			startGame()
+		end
+	end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		keys[input.KeyCode] = nil
+	end
+end)
+
+pcall(function()
+	connect(UserInputService.WindowFocusReleased, function()
+		keys = {}
+	end)
+end)
+
+connect(RunService.RenderStepped, function(dt)
+	local ok, err = pcall(onFrame, dt)
+	if not ok then
+		warn("[FruitCatcher] Erro no loop: " .. tostring(err))
+	end
+end)
+
+----------------------------------------------------------------------
+-- DESTRUIÇÃO / REGISTRO DA INSTÂNCIA
+----------------------------------------------------------------------
+local instanceHandle = {}
+
+destroyAll = function()
+	if state == "destroyed" then
+		return
+	end
+	state = "destroyed"
+	unbindMovement()
+	for _, c in ipairs(connections) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	connections = {}
+	safeStop(music)
+	safeDestroy(music)
+	safeDestroy(sfxCatch)
+	safeDestroy(sfxLose)
+	safeDestroy(gui)
+	if ENV[INSTANCE_KEY] == instanceHandle then
+		ENV[INSTANCE_KEY] = nil
+	end
+end
+
+instanceHandle.Destroy = destroyAll
+ENV[INSTANCE_KEY] = instanceHandle
+
+----------------------------------------------------------------------
+-- INÍCIO: mostra o menu
+----------------------------------------------------------------------
+applyVolumes()
+updateHud()
+showOverlay(menuOverlay, menuCard, menuScale)
